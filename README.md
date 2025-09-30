@@ -2,6 +2,10 @@
 
 基于 Vue 3 + TypeScript + Vite 的前端项目，集成画布编辑（`CanvasEditor`）、图片生成（`ImageGenerator`）与背景移除（`backgroundRemoval`）等能力。使用 `<script setup>` 语法与现代构建工具链，开箱即用。
 
+![项目截图](assets/image.png)
+
+
+
 ## 技术栈
 
 - **框架**: Vue 3
