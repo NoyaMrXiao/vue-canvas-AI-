@@ -1,6 +1,7 @@
 <template>
-  <div class="fixed top-0 left-0 w-screen h-screen m-0 p-0 overflow-hidden">
-    <div class="relative w-full h-full bg-gray-900 select-none" @drop="handleDrop" @dragover="handleDragOver" @dragenter="handleDragEnter" @contextmenu="handleContainerRightClick">
+  <div class="relative w-screen h-screen overflow-hidden">
+    <!-- 画布区域 -->
+    <div class="absolute inset-0 bg-gray-900 select-none" @drop="handleDrop" @dragover="handleDragOver" @dragenter="handleDragEnter" @contextmenu="handleContainerRightClick">
       <canvas ref="canvasRef" class="block w-full h-full" @contextmenu="handleCanvasRightClick"></canvas>
       <input
         type="file"
@@ -26,6 +27,10 @@
           <span v-if="isProcessing">处理中...</span>
           <span v-else>去除背景</span>
         </div>
+        <div class="flex items-center px-4 py-3 text-white cursor-pointer hover:bg-white/10 transition-colors text-sm" @click.stop="handleCropImage">
+          <span class="mr-3 text-base w-5 text-center">✂️</span>
+          裁剪图片
+        </div>
         <div class="flex items-center px-4 py-3 text-white cursor-pointer hover:bg-white/10 transition-colors text-sm" @click.stop="downloadActiveImage">
           <span class="mr-3 text-base w-5 text-center">⬇️</span>
           下载图片
@@ -40,25 +45,78 @@
         </div>
       </div>
     </div>
+    
+    <!-- 图片生成组件 - 固定在底部 -->
+    <div class="fixed bottom-8 left-0 right-0 z-40">
+      <ImageGenerator 
+        @add-image="handleAddGeneratedImage" 
+        @generation-start="handleGenerationStart"
+        @generation-complete="handleGenerationComplete"
+        :has-active-image="hasActiveImage"
+        :get-active-image-data-u-r-l="getActiveImageDataURL"
+        :replace-active-image-with="replaceActiveImageWith"
+      />
+    </div>
+  </div>
+
+  <!-- 裁剪弹窗 -->
+  <div v-if="showCropModal" class="fixed inset-0 bg-black/80 flex items-center justify-center z-50" @click="closeCropModal">
+    <div class="bg-white rounded-lg p-6 w-[90vw] h-[90vh] flex flex-col" @click.stop>
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="text-xl font-bold text-gray-800">裁剪图片</h3>
+        <button @click="closeCropModal" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
+      </div>
+      
+      <!-- 裁剪区域 -->
+      <div class="flex-1 flex flex-col">
+        <h4 class="text-sm font-medium text-gray-600 mb-2">拖拽调整裁剪框，选择要保留的区域</h4>
+        <div class="flex-1 border border-gray-300 rounded-lg overflow-hidden relative bg-gray-50">
+          <canvas ref="cropCanvasRef" class="w-full h-full"></canvas>
+        </div>
+        
+        <!-- 裁剪控制 -->
+        <div class="mt-4 flex gap-2 justify-center">
+          <button @click="confirmCrop" class="px-6 py-2 bg-green-500 text-white rounded hover:bg-green-600 transition-colors font-medium">
+            确认裁剪
+          </button>
+          <button @click="closeCropModal" class="px-6 py-2 bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors font-medium">
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script lang="ts">
 import { defineComponent, ref, onMounted, onUnmounted } from 'vue'
-import { Canvas, Text, Image, Circle, Rect } from 'fabric'
+import { Canvas, Text, Image, Circle, Rect, Gradient, Point } from 'fabric'
 import { removeBackground } from '../api/backgroundRemoval'
+import ImageGenerator from './ImageGenerator.vue'
 
 export default defineComponent({
   name: 'CanvasEditor',
+  components: {
+    ImageGenerator
+  },
   setup() {
     const canvasRef = ref<HTMLCanvasElement>()
     const fileInput = ref<HTMLInputElement>()
+    const cropCanvasRef = ref<HTMLCanvasElement>()
     const showContextMenu = ref(false)
     const contextMenuPosition = ref({ x: 0, y: 0 })
     const isProcessing = ref(false)
+    const showCropModal = ref(false)
+    const cropImageData = ref<{ originalImage: string; imageObject: any } | null>(null)
     let canvas: Canvas | null = null
+    // 提供给 ImageGenerator 的桥接：是否有选中图像
+    const hasActiveImage = ref(false)
     let processingMask: any = null
     let processingAnimation: number | null = null
+    let cropCanvas: Canvas | null = null
+    // 生成占位框与动画管理
+    const generationPlaceholders = new Map<string, { frame: Rect, label: Text }>()
+    const generationAnimations = new Map<string, number>()
 
     onMounted(() => {
       if (canvasRef.value) {
@@ -77,6 +135,12 @@ export default defineComponent({
         
         // 监听画布事件
         setupCanvasEvents()
+
+        // 启用鼠标滚轮缩放
+        setupWheelZoom()
+        
+        // 添加键盘事件监听
+        document.addEventListener('keydown', handleKeyDown)
       }
     })
 
@@ -84,6 +148,11 @@ export default defineComponent({
       if (canvas) {
         canvas.dispose()
       }
+      // 清理键盘事件监听
+      document.removeEventListener('keydown', handleKeyDown)
+      // 停止所有生成动画
+      generationAnimations.forEach((id) => cancelAnimationFrame(id))
+      generationAnimations.clear()
     })
 
 
@@ -136,6 +205,153 @@ export default defineComponent({
 
     const handleDragEnter = (event: DragEvent) => {
       event.preventDefault()
+    }
+
+    // 处理添加生成的图片到画布
+    const handleAddGeneratedImage = (imageUrl: string) => {
+      if (!canvas) return
+      
+      Image.fromURL(imageUrl).then((img) => {
+        if (img && canvas) {
+          // 设置图片在画布中心
+          img.set({
+            left: canvas.getWidth() / 2,
+            top: canvas.getHeight() / 2,
+            originX: 'center',
+            originY: 'center',
+            scaleX: 0.5,
+            scaleY: 0.5,
+            selectable: true,
+            evented: true
+          })
+          
+          canvas.add(img)
+          canvas.setActiveObject(img)
+          canvas.renderAll()
+          
+          console.log('生成的图片已添加到画布')
+        }
+      }).catch((error) => {
+        console.error('添加生成图片失败:', error)
+        alert('添加图片失败，请重试')
+      })
+    }
+
+    // 开始生成：在画布中心放置预填充画框并启动动画
+    const handleGenerationStart = (payload: { token: string; width: number; height: number; prompt: string; mode: 'text' | 'image' }) => {
+      if (!canvas) return
+      const canvasWidth = canvas.getWidth()
+      const canvasHeight = canvas.getHeight()
+
+      // 目标显示区域：画布较短边的 50%
+      const maxDisplayWidth = canvasWidth * 0.5
+      const maxDisplayHeight = canvasHeight * 0.5
+      const targetScale = Math.min(maxDisplayWidth / payload.width, maxDisplayHeight / payload.height, 1)
+      const displayWidth = payload.width * targetScale
+      const displayHeight = payload.height * targetScale
+
+      const centerX = canvasWidth / 2
+      const centerY = canvasHeight / 2
+
+      const frame = new Rect({
+        left: centerX,
+        top: centerY,
+        originX: 'center',
+        originY: 'center',
+        width: displayWidth,
+        height: displayHeight,
+        fill: 'rgba(0,0,0,0.06)',
+        stroke: '#60a5fa',
+        strokeWidth: 3,
+        strokeDashArray: [12, 8],
+        rx: 8,
+        ry: 8,
+        selectable: false,
+        evented: false
+      })
+
+      const label = new Text('生成中...', {
+        left: centerX,
+        top: centerY,
+        originX: 'center',
+        originY: 'center',
+        fontSize: 20,
+        fill: '#ffffff',
+        selectable: false,
+        evented: false
+      })
+
+      generationPlaceholders.set(payload.token, { frame, label })
+      canvas.add(frame)
+      canvas.add(label)
+      frame.setCoords(); label.setCoords()
+      canvas.renderAll()
+
+      // 启动描边虚线流动动画
+      let t = 0
+      const animate = () => {
+        t += 1.5
+        frame.set({ strokeDashOffset: t })
+        const alpha = 0.7 + Math.sin(t / 8) * 0.2
+        label.set({ opacity: alpha })
+        canvas?.renderAll()
+        const id = requestAnimationFrame(animate)
+        generationAnimations.set(payload.token, id)
+      }
+      const id = requestAnimationFrame(animate)
+      generationAnimations.set(payload.token, id)
+    }
+
+    // 生成完成：用最终图片替换占位框
+    const handleGenerationComplete = (payload: { token: string; url: string }) => {
+      if (!canvas) return
+      const placeholder = generationPlaceholders.get(payload.token)
+      if (!placeholder) {
+        // 若无占位，作为普通新增处理
+        if (payload.url) return handleAddGeneratedImage(payload.url)
+        return
+      }
+
+      // 停止动画并移除占位
+      const animId = generationAnimations.get(payload.token)
+      if (animId) cancelAnimationFrame(animId)
+      generationAnimations.delete(payload.token)
+
+      const { frame, label } = placeholder
+      const targetLeft = frame.left || canvas.getWidth() / 2
+      const targetTop = frame.top || canvas.getHeight() / 2
+      const targetWidth = frame.width || 256
+      const targetHeight = frame.height || 256
+
+      Image.fromURL(payload.url).then((img) => {
+        if (!img || !canvas) return
+        const scaleX = targetWidth / (img.width || 1)
+        const scaleY = targetHeight / (img.height || 1)
+        img.set({
+          left: targetLeft,
+          top: targetTop,
+          originX: 'center',
+          originY: 'center',
+          scaleX,
+          scaleY,
+          selectable: true,
+          evented: true
+        })
+
+        canvas.remove(frame)
+        canvas.remove(label)
+        generationPlaceholders.delete(payload.token)
+
+        canvas.add(img)
+        canvas.setActiveObject(img)
+        canvas.renderAll()
+      }).catch((error) => {
+        console.error('生成完成替换失败，降级为普通添加:', error)
+        canvas?.remove(frame)
+        canvas?.remove(label)
+        generationPlaceholders.delete(payload.token)
+        if (payload.url) handleAddGeneratedImage(payload.url)
+      })
     }
 
     const processMultipleFiles = (files: File[]) => {
@@ -215,12 +431,103 @@ export default defineComponent({
       // 监听对象选择事件
       canvas.on('selection:created', (e) => {
         console.log('对象被选中:', e.selected)
+        const obj = canvas?.getActiveObject()
+        hasActiveImage.value = !!obj && obj.type === 'image'
+      })
+      // 监听选中对象更新（比如从一个对象切到另一个）
+      canvas.on('selection:updated', (e) => {
+        console.log('选中对象更新:', e.selected)
+        const obj = canvas?.getActiveObject()
+        hasActiveImage.value = !!obj && obj.type === 'image'
       })
       
       // 监听对象取消选择事件
       canvas.on('selection:cleared', () => {
         console.log('取消选择对象')
         closeContextMenu()
+        hasActiveImage.value = false
+      })
+    }
+    // 获取当前选中图片的 DataURL（用于图生图参考）
+    const getActiveImageDataURL = (): string | null => {
+      if (!canvas) return null
+      const activeObject = canvas.getActiveObject()
+      if (activeObject && activeObject.type === 'image') {
+        try {
+          return (activeObject as any).toDataURL({ format: 'png', quality: 1, multiplier: 1 })
+        } catch {
+          return null
+        }
+      }
+      return null
+    }
+
+    // 用新图片替换当前选中图片
+    const replaceActiveImageWith = (imageUrl: string) => {
+      if (!canvas) return
+      const activeObject = canvas.getActiveObject()
+      if (!activeObject || activeObject.type !== 'image') return
+
+      const originalProps = {
+        left: activeObject.left,
+        top: activeObject.top,
+        scaleX: activeObject.scaleX,
+        scaleY: activeObject.scaleY,
+        angle: activeObject.angle,
+        originX: (activeObject as any).originX,
+        originY: (activeObject as any).originY,
+        width: (activeObject as any).width,
+        height: (activeObject as any).height
+      }
+
+      Image.fromURL(imageUrl).then((newImg) => {
+        if (!newImg || !canvas) return
+        // 保持显示尺寸
+        const originalDisplayWidth = (originalProps.width as number) * (originalProps.scaleX as number)
+        const originalDisplayHeight = (originalProps.height as number) * (originalProps.scaleY as number)
+        const newScaleX = originalDisplayWidth / (newImg.width || 1)
+        const newScaleY = originalDisplayHeight / (newImg.height || 1)
+
+        newImg.set({
+          left: originalProps.left,
+          top: originalProps.top,
+          originX: originalProps.originX,
+          originY: originalProps.originY,
+          angle: originalProps.angle,
+          scaleX: newScaleX,
+          scaleY: newScaleY,
+          selectable: true,
+          evented: true
+        })
+
+        canvas.remove(activeObject)
+        canvas.add(newImg)
+        canvas.setActiveObject(newImg)
+        canvas.renderAll()
+      }).catch((err) => {
+        console.error('替换选中图片失败:', err)
+      })
+    }
+
+    // 鼠标滚轮缩放（以鼠标位置为中心缩放）
+    const setupWheelZoom = () => {
+      if (!canvas) return
+      const MIN_ZOOM = 0.2
+      const MAX_ZOOM = 4
+      canvas.on('mouse:wheel', (opt: any) => {
+        const event = opt.e as WheelEvent
+        let zoom = canvas!.getZoom()
+        // 使用指数缩放，使滚轮缩放更平滑
+        const delta = event.deltaY
+        const zoomFactor = 0.999 ** delta
+        zoom *= zoomFactor
+        if (zoom < MIN_ZOOM) zoom = MIN_ZOOM
+        if (zoom > MAX_ZOOM) zoom = MAX_ZOOM
+
+        const pointer = new Point(event.offsetX, event.offsetY)
+        canvas!.zoomToPoint(pointer, zoom)
+        event.preventDefault()
+        event.stopPropagation()
       })
     }
 
@@ -407,6 +714,9 @@ export default defineComponent({
     const addProcessingMask = (imageObject: any) => {
       if (!canvas) return
       
+      // 取消当前选中状态，避免选择高亮覆盖蒙版
+      canvas.discardActiveObject()
+      
       const displayWidth = Math.abs(imageObject.getScaledWidth?.() || imageObject.width * imageObject.scaleX)
       const displayHeight = Math.abs(imageObject.getScaledHeight?.() || imageObject.height * imageObject.scaleY)
       
@@ -420,38 +730,55 @@ export default defineComponent({
         height: displayHeight,
         originX: 'center',
         originY: 'center',
-        fill: '#ff0000',
-        opacity: 1,
+        fill: new Gradient({
+          type: 'radial',
+          coords: { x1: displayWidth/2, y1: displayHeight/2, x2: displayWidth/2, y2: displayHeight/2, r1: 0, r2: Math.max(displayWidth, displayHeight)/2 },
+          colorStops: [
+            { offset: 0, color: 'rgba(59, 130, 246, 0.9)' },
+            { offset: 0.3, color: 'rgba(147, 51, 234, 0.7)' },
+            { offset: 0.6, color: 'rgba(236, 72, 153, 0.5)' },
+            { offset: 1, color: 'rgba(251, 191, 36, 0.3)' }
+          ]
+        }),
+        opacity: 0.8,
         stroke: '#ffffff',
-        strokeWidth: 1,
+        strokeWidth: 3,
+        strokeDashArray: [10, 5],
         selectable: false,
         evented: false,
         angle: imageObject.angle || 0
       })
       
-      const text = new Text('处理中...', {
+      const text = new Text('AI 处理中...', {
         left: center.x,
         top: center.y,
         originX: 'center',
         originY: 'center',
-        fontSize: 20,
-        fill: 'white',
+        fontSize: 28,
+        fontWeight: 'bold',
+        fill: '#ffffff',
         textAlign: 'center',
         selectable: false,
         evented: false,
-        angle: imageObject.angle || 0
+        angle: imageObject.angle || 0,
       })
       
       processingMask = { mask, text }
       canvas.add(mask)
       canvas.add(text)
-      // 确保在最前面（Fabric v6 使用对象方法）
-      if (typeof (mask as any).bringToFront === 'function') {
-        ;(mask as any).bringToFront()
+      
+      // 确保蒙版在最前面，使用更高的z-index
+      if (typeof (mask as any).bringObjectToFront === 'function') {
+        ;(mask as any).bringObjectToFront()
       }
-      if (typeof (text as any).bringToFront === 'function') {
-        ;(text as any).bringToFront()
+      if (typeof (text as any).bringObjectToFront === 'function') {
+        ;(text as any).bringObjectToFront()
       }
+      
+      // 强制设置蒙版为最高层级
+      mask.set({ zIndex: 9999 })
+      text.set({ zIndex: 10000 })
+      
       mask.setCoords()
       text.setCoords()
       canvas.renderAll()
@@ -479,15 +806,48 @@ export default defineComponent({
     const startProcessingAnimation = () => {
       if (!processingMask) return
       
-      // Debug: 保持纯红并在最前
-      processingMask.mask.set({ fill: '#ff0000', opacity: 1 })
-      if (typeof (processingMask.mask as any).bringToFront === 'function') {
-        ;(processingMask.mask as any).bringToFront()
+      // 确保没有选中任何对象
+      canvas?.discardActiveObject()
+      
+      let animationTime = 0
+      const animate = () => {
+        if (!processingMask) return
+        
+        animationTime += 0.05
+        
+        // 旋转动画
+        const rotation = Math.sin(animationTime) * 0.1
+        processingMask.mask.set({ angle: rotation })
+        
+        // 透明度呼吸效果
+        const opacity = 0.6 + Math.sin(animationTime * 2) * 0.2
+        processingMask.mask.set({ opacity })
+        
+        // 描边动画
+        const dashOffset = animationTime * 10
+        processingMask.mask.set({ strokeDashOffset: dashOffset })
+        
+        // 文本闪烁效果
+        const textOpacity = 0.7 + Math.sin(animationTime * 3) * 0.3
+        processingMask.text.set({ opacity: textOpacity })
+        
+        // 文本缩放效果
+        const scale = 1 + Math.sin(animationTime * 1.5) * 0.1
+        processingMask.text.set({ scaleX: scale, scaleY: scale })
+        
+        // 确保在最前面
+        if (typeof (processingMask.mask as any).bringObjectToFront === 'function') {
+          ;(processingMask.mask as any).bringObjectToFront()
+        }
+        if (typeof (processingMask.text as any).bringObjectToFront === 'function') {
+          ;(processingMask.text as any).bringObjectToFront()
+        }
+        
+        canvas?.renderAll()
+        processingAnimation = requestAnimationFrame(animate)
       }
-      if (typeof (processingMask.text as any).bringToFront === 'function') {
-        ;(processingMask.text as any).bringToFront()
-      }
-      canvas?.renderAll()
+      
+      animate()
     }
 
     // AI修图功能
@@ -530,6 +890,239 @@ export default defineComponent({
       e.preventDefault()
     }
 
+    // 裁剪图片功能
+    const handleCropImage = () => {
+      if (!canvas) return
+      
+      const activeObject = canvas.getActiveObject()
+      if (activeObject && activeObject.type === 'image') {
+        closeContextMenu()
+        openCropModal(activeObject)
+      }
+    }
+
+    // 打开裁剪弹窗
+    const openCropModal = (imageObject: any) => {
+      const imageDataURL = imageObject.toDataURL({
+        format: 'png',
+        quality: 1,
+        multiplier: 1
+      })
+      
+      cropImageData.value = {
+        originalImage: imageDataURL,
+        imageObject: imageObject
+      }
+      showCropModal.value = true
+      
+      // 等待DOM更新后初始化裁剪画布
+      setTimeout(() => {
+        initCropCanvas(imageObject)
+      }, 100)
+    }
+
+    // 初始化裁剪画布
+    const initCropCanvas = (imageObject: any) => {
+      if (!cropCanvasRef.value) return
+      
+      const canvasElement = cropCanvasRef.value
+      const rect = canvasElement.getBoundingClientRect()
+      
+      // 设置画布尺寸为容器的实际尺寸
+      const canvasWidth = rect.width
+      const canvasHeight = rect.height
+      
+      cropCanvas = new Canvas(canvasElement, {
+        width: canvasWidth,
+        height: canvasHeight,
+        backgroundColor: '#f8f9fa'
+      })
+      
+      // 添加图片到裁剪画布
+      Image.fromURL(cropImageData.value?.originalImage || '').then((img) => {
+        if (img && cropCanvas) {
+          // 计算图片在画布中的合适大小，留出更多边距
+          const padding = 20
+          const maxWidth = canvasWidth - padding * 2
+          const maxHeight = canvasHeight - padding * 2
+          const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1)
+          
+          img.set({
+            left: canvasWidth / 2,
+            top: canvasHeight / 2,
+            originX: 'center',
+            originY: 'center',
+            scaleX: scale,
+            scaleY: scale,
+            selectable: true,
+            evented: true
+          })
+          
+          cropCanvas.add(img)
+          
+          // 创建裁剪框，初始覆盖整个图片
+          const cropRect = new Rect({
+            left: img.left - img.width * img.scaleX / 2,
+            top: img.top - img.height * img.scaleY / 2,
+            width: img.width * img.scaleX,
+            height: img.height * img.scaleY,
+            fill: 'rgba(0, 255, 0, 0.1)',
+            stroke: '#00ff00',
+            strokeWidth: 3,
+            strokeDashArray: [8, 4],
+            selectable: true,
+            evented: true,
+            hasControls: true,
+            hasBorders: true,
+            lockRotation: true,
+            lockScalingFlip: true,
+            cornerColor: '#00ff00',
+            cornerSize: 12,
+            transparentCorners: false,
+            borderColor: '#00ff00',
+            borderScaleFactor: 3,
+            cornerStyle: 'circle'
+          })
+          
+          cropCanvas.add(cropRect)
+          cropCanvas.setActiveObject(cropRect)
+          cropCanvas.renderAll()
+        }
+      })
+    }
+
+    // 关闭裁剪弹窗
+    const closeCropModal = () => {
+      showCropModal.value = false
+      cropImageData.value = null
+      if (cropCanvas) {
+        cropCanvas.dispose()
+        cropCanvas = null
+      }
+    }
+
+    // 确认裁剪
+    const confirmCrop = () => {
+      if (!cropCanvas || !cropImageData.value) return
+      
+      const activeObject = cropCanvas.getActiveObject()
+      if (activeObject && activeObject.type === 'rect') {
+        const imageObject = cropCanvas.getObjects().find(obj => obj.type === 'image')
+        if (imageObject) {
+          executeCropFromModal(imageObject, activeObject)
+        }
+      }
+    }
+
+    // 从弹窗执行裁剪
+    const executeCropFromModal = (imageObject: any, cropRect: any) => {
+      if (!canvas || !cropImageData.value) return
+      
+      try {
+        // 计算裁剪区域相对于图片的位置
+        const imageLeft = imageObject.left - imageObject.width * imageObject.scaleX / 2
+        const imageTop = imageObject.top - imageObject.height * imageObject.scaleY / 2
+        
+        const cropLeft = (cropRect.left - imageLeft) / imageObject.scaleX
+        const cropTop = (cropRect.top - imageTop) / imageObject.scaleY
+        const cropWidth = cropRect.width / imageObject.scaleX
+        const cropHeight = cropRect.height / imageObject.scaleY
+        
+        // 创建新的裁剪后的图片
+        const croppedCanvas = document.createElement('canvas')
+        const ctx = croppedCanvas.getContext('2d')
+        
+        if (!ctx) return
+        
+        croppedCanvas.width = cropWidth
+        croppedCanvas.height = cropHeight
+        
+        // 绘制裁剪后的图片
+        ctx.drawImage(
+          imageObject.getElement(),
+          cropLeft, cropTop, cropWidth, cropHeight,
+          0, 0, cropWidth, cropHeight
+        )
+        
+        // 创建新的图片对象
+        const croppedDataURL = croppedCanvas.toDataURL('image/png')
+        
+        Image.fromURL(croppedDataURL).then((newImg) => {
+          if (newImg && canvas) {
+            // 获取原图片的位置和大小
+            const originalImg = cropImageData.value?.imageObject
+            if (originalImg) {
+              // 设置新图片的位置和大小
+              newImg.set({
+                left: (originalImg.left || 0) + 10,
+                top: (originalImg.top || 0) + 10,
+                scaleX: originalImg.scaleX,
+                scaleY: originalImg.scaleY,
+                angle: originalImg.angle,
+                originX: originalImg.originX,
+                originY: originalImg.originY,
+                selectable: true,
+                evented: true
+              })
+              
+              // 仅添加新图片，不移除原图片
+              canvas.add(newImg)
+              canvas.setActiveObject(newImg)
+              canvas.renderAll()
+              
+              console.log('图片裁剪完成')
+            }
+          }
+        })
+        
+        closeCropModal()
+        
+      } catch (error) {
+        console.error('裁剪失败:', error)
+        alert('裁剪失败，请重试')
+      }
+    }
+
+
+    // 键盘事件处理函数
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!canvas) return
+      // 当焦点在可编辑元素上（如输入框）时，不处理删除逻辑
+      const target = event.target as HTMLElement | null
+      if (target) {
+        const isInputLike = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable || !!target.closest('input, textarea, [contenteditable="true"]')
+        if (isInputLike) {
+          return
+        }
+      }
+      
+      // 检查是否按下了Delete键或Backspace键
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        const activeObject = canvas.getActiveObject()
+        
+        if (activeObject) {
+          // 如果有选中的对象，删除它
+          canvas.remove(activeObject)
+          canvas.renderAll()
+          console.log('已删除选中对象')
+        } else {
+          // 如果没有选中对象，删除最后一个添加的对象
+          const objects = canvas.getObjects()
+          if (objects.length > 0) {
+            const lastObject = objects[objects.length - 1]
+            if (lastObject) {
+              canvas.remove(lastObject)
+            }
+            canvas.renderAll()
+            console.log('已删除最后一个对象')
+          }
+        }
+        
+        // 关闭右键菜单（如果打开的话）
+        closeContextMenu()
+      }
+    }
+
     // 监听全局点击事件
     onMounted(() => {
       document.addEventListener('mousedown', handleClickOutside)
@@ -545,9 +1138,12 @@ export default defineComponent({
     return {
       canvasRef,
       fileInput,
+      cropCanvasRef,
       showContextMenu,
       contextMenuPosition,
       isProcessing,
+      showCropModal,
+      cropImageData,
       handleFileUpload,
       handleDrop,
       handleDragOver,
@@ -555,9 +1151,18 @@ export default defineComponent({
       handleContainerRightClick,
       handleCanvasRightClick,
       handleRemoveBackground,
+      handleCropImage,
+      closeCropModal,
+      confirmCrop,
       downloadActiveImage,
       aiEdit,
-      closeContextMenu
+      closeContextMenu,
+      handleAddGeneratedImage,
+      handleGenerationStart,
+      handleGenerationComplete,
+      hasActiveImage,
+      getActiveImageDataURL,
+      replaceActiveImageWith
     }
   }
 })
